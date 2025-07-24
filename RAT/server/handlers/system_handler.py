@@ -1,536 +1,421 @@
 """
 System Handler - Gestionnaire des informations système côté serveur
-Traitement et analyse des informations système des agents
+Traitement et formatage des informations système des agents
 """
 
-import logging
 import json
+import logging
 from datetime import datetime
 from typing import Dict, Any, List, Optional
-from pathlib import Path
-
-from shared.helpers import format_bytes, sanitize_data
 
 logger = logging.getLogger(__name__)
 
 class SystemHandler:
-    """Gestionnaire des informations système pour le serveur"""
+    """Gestionnaire des informations système du serveur"""
     
     def __init__(self):
-        # Base de données des systèmes connectés
-        self.system_database = {}
+        # Cache des informations système par session
+        self.system_info_cache = {}
         
         # Statistiques
-        self.systems_analyzed = 0
-        self.unique_platforms = set()
-        self.unique_users = set()
-        
-        # Répertoire pour sauvegarder les informations
-        self.data_dir = Path("server/data/system_info")
-        self.data_dir.mkdir(parents=True, exist_ok=True)
+        self.info_requests = 0
+        self.last_update = {}
         
         logger.info("SystemHandler initialisé")
     
-    def handle_system_info(self, session, system_data: Dict[str, Any]) -> str:
+    def process_system_info(self, session, system_data: Dict[str, Any]) -> str:
         """
-        Traite les informations système reçues d'un agent
+        Traite et formate les informations système reçues
         
         Args:
-            session: Session client
+            session: Session de l'agent
             system_data: Données système reçues
-            
+        
         Returns:
-            str: Résumé formaté des informations
+            str: Informations formatées pour affichage
         """
         try:
-            # Stockage des informations dans la base
-            self.system_database[session.id] = {
-                'session_id': session.id,
-                'system_data': system_data,
-                'last_updated': datetime.now().isoformat(),
-                'client_address': session.address
-            }
+            # Mise en cache des informations
+            self.system_info_cache[session.id] = system_data
+            self.last_update[session.id] = datetime.now()
+            self.info_requests += 1
             
-            # Mise à jour des statistiques
-            self._update_statistics(system_data)
+            # Formatage pour affichage
+            formatted_info = self._format_system_info(system_data)
             
-            # Sauvegarde persistante
-            self._save_system_info(session.id, system_data)
-            
-            # Analyse de sécurité basique
-            security_notes = self._analyze_security(system_data)
-            
-            # Formatage du résumé
-            return self._format_system_summary(session.id, system_data, security_notes)
+            logger.info(f"Informations système reçues de {session.id}")
+            return formatted_info
             
         except Exception as e:
-            logger.error(f"Erreur dans handle_system_info: {e}")
+            logger.error(f"Erreur traitement info système: {e}")
             return f"[!] Erreur lors du traitement des informations système: {e}"
     
-    def handle_network_config(self, session, network_data: Dict[str, Any]) -> str:
+    def process_network_config(self, session, network_data: Dict[str, Any]) -> str:
         """
-        Traite la configuration réseau reçue
+        Traite et formate la configuration réseau
         
         Args:
-            session: Session client
-            network_data: Données de configuration réseau
-            
+            session: Session de l'agent
+            network_data: Données réseau reçues
+        
         Returns:
             str: Configuration réseau formatée
         """
         try:
-            # Mise à jour des informations stockées
-            if session.id in self.system_database:
-                self.system_database[session.id]['network_config'] = network_data
-                self.system_database[session.id]['last_updated'] = datetime.now().isoformat()
-            
-            # Extraction et formatage des données réseau
-            if 'output' in network_data:
-                network_output = network_data['output']
-                
-                # Analyse des informations réseau
-                network_analysis = self._analyze_network_config(network_output)
-                
-                formatted_output = f"Configuration réseau de {session.id}:\\n"
-                formatted_output += "=" * 50 + "\\n"
-                formatted_output += network_output
-                
-                if network_analysis:
-                    formatted_output += "\\n\\nAnalyse réseau:\\n"
-                    formatted_output += "-" * 20 + "\\n"
-                    for key, value in network_analysis.items():
-                        formatted_output += f"{key}: {value}\\n"
-                
-                return formatted_output
+            if network_data.get('status') == 'success':
+                output = network_data.get('output', '')
+                return self._format_network_output(output)
             else:
-                return "Aucune donnée de configuration réseau reçue"
+                return f"[!] Erreur récupération config réseau: {network_data.get('output', 'Erreur inconnue')}"
                 
         except Exception as e:
-            logger.error(f"Erreur dans handle_network_config: {e}")
-            return f"[!] Erreur lors du traitement de la configuration réseau: {e}"
+            logger.error(f"Erreur traitement config réseau: {e}")
+            return f"[!] Erreur lors du traitement: {e}"
     
-    def _update_statistics(self, system_data: Dict[str, Any]):
-        """Met à jour les statistiques globales"""
+    def _format_system_info(self, system_data: Dict[str, Any]) -> str:
+        """Formate les informations système pour affichage"""
         try:
-            self.systems_analyzed += 1
+            if isinstance(system_data, str):
+                # Si c'est déjà une chaîne JSON, la parser
+                try:
+                    system_data = json.loads(system_data)
+                except:
+                    return system_data
             
-            # Collecte des plateformes uniques
-            if 'platform' in system_data:
-                self.unique_platforms.add(system_data['platform'])
-            
-            # Collecte des utilisateurs uniques
-            if 'username' in system_data:
-                self.unique_users.add(system_data['username'])
-                
-        except Exception as e:
-            logger.warning(f"Erreur mise à jour statistiques: {e}")
-    
-    def _save_system_info(self, session_id: str, system_data: Dict[str, Any]):
-        """Sauvegarde les informations système sur disque"""
-        try:
-            timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-            filename = f"{session_id[:8]}_{timestamp}_sysinfo.json"
-            file_path = self.data_dir / filename
-            
-            save_data = {
-                'session_id': session_id,
-                'timestamp': datetime.now().isoformat(),
-                'system_data': sanitize_data(system_data),
-                'analysis': self._analyze_security(system_data)
-            }
-            
-            with open(file_path, 'w', encoding='utf-8') as f:
-                json.dump(save_data, f, indent=2, ensure_ascii=False)
-                
-            logger.info(f"Informations système sauvegardées: {filename}")
-            
-        except Exception as e:
-            logger.warning(f"Erreur sauvegarde informations système: {e}")
-    
-    def _analyze_security(self, system_data: Dict[str, Any]) -> Dict[str, str]:
-        """Analyse de sécurité basique des informations système"""
-        try:
-            security_notes = {}
-            
-            # Vérification des privilèges
-            if system_data.get('is_admin') or system_data.get('username') == 'root':
-                security_notes['privileges'] = "⚠️ Privilèges administrateur détectés"
-            else:
-                security_notes['privileges'] = "✓ Utilisateur standard"
-            
-            # Vérification de l'antivirus (si disponible)
-            if 'antivirus' in system_data:
-                av_list = system_data['antivirus']
-                if av_list and len(av_list) > 0:
-                    security_notes['antivirus'] = f"✓ Antivirus détecté: {', '.join(av_list)}"
-                else:
-                    security_notes['antivirus'] = "⚠️ Aucun antivirus détecté"
-            
-            # Vérification du firewall (si disponible)
-            if 'firewall' in system_data:
-                fw_info = system_data['firewall']
-                if isinstance(fw_info, dict) and fw_info.get('status') == 'enabled':
-                    security_notes['firewall'] = "✓ Firewall activé"
-                else:
-                    security_notes['firewall'] = "⚠️ Firewall désactivé ou inconnu"
-            
-            # Vérification de l'UAC (Windows)
-            if 'uac_enabled' in system_data:
-                if system_data['uac_enabled']:
-                    security_notes['uac'] = "✓ UAC activé"
-                else:
-                    security_notes['uac'] = "⚠️ UAC désactivé"
-            
-            # Analyse de la plateforme
-            platform = system_data.get('platform', '').lower()
-            if 'windows' in platform:
-                security_notes['platform'] = f"Windows détecté: {system_data.get('platform')}"
-            elif 'linux' in platform:
-                security_notes['platform'] = f"Linux détecté: {system_data.get('platform')}"
-            elif 'darwin' in platform or 'mac' in platform:
-                security_notes['platform'] = f"macOS détecté: {system_data.get('platform')}"
-            else:
-                security_notes['platform'] = f"Plateforme: {system_data.get('platform', 'Inconnue')}"
-            
-            return security_notes
-            
-        except Exception as e:
-            logger.warning(f"Erreur analyse sécurité: {e}")
-            return {'error': 'Erreur lors de l\'analyse de sécurité'}
-    
-    def _analyze_network_config(self, network_output: str) -> Dict[str, str]:
-        """Analyse basique de la configuration réseau"""
-        try:
-            analysis = {}
-            
-            # Recherche d'adresses IP
-            import re
-            ip_pattern = r'\\b(?:[0-9]{1,3}\\.){3}[0-9]{1,3}\\b'
-            ips_found = re.findall(ip_pattern, network_output)
-            
-            if ips_found:
-                # Filtrage des IPs privées et publiques
-                private_ips = []
-                public_ips = []
-                
-                for ip in set(ips_found):  # Suppression des doublons
-                    parts = ip.split('.')
-                    if len(parts) == 4:
-                        first_octet = int(parts[0])
-                        second_octet = int(parts[1])
-                        
-                        # Classification IP privée/publique (basique)
-                        if (first_octet == 10 or 
-                            (first_octet == 172 and 16 <= second_octet <= 31) or
-                            (first_octet == 192 and second_octet == 168) or
-                            ip.startswith('127.')):
-                            private_ips.append(ip)
-                        elif not ip.startswith('0.') and not ip.startswith('255.'):
-                            public_ips.append(ip)
-                
-                if private_ips:
-                    analysis['private_ips'] = ', '.join(private_ips)
-                if public_ips:
-                    analysis['public_ips'] = ', '.join(public_ips)
-            
-            # Recherche d'interfaces réseau
-            if 'ethernet' in network_output.lower() or 'wifi' in network_output.lower():
-                analysis['connectivity'] = "Connexions Ethernet/WiFi détectées"
-            
-            # Recherche de passerelles
-            if 'gateway' in network_output.lower() or 'default' in network_output.lower():
-                analysis['gateway'] = "Passerelle par défaut configurée"
-            
-            return analysis
-            
-        except Exception as e:
-            logger.warning(f"Erreur analyse réseau: {e}")
-            return {'error': 'Erreur lors de l\'analyse réseau'}
-    
-    def _format_system_summary(self, session_id: str, system_data: Dict[str, Any], security_notes: Dict[str, str]) -> str:
-        """Formate un résumé des informations système"""
-        try:
-            summary = f"Informations système - {session_id}\\n"
-            summary += "=" * 50 + "\\n"
+            output = []
+            output.append("╔════════════════════════════════════════════════════════════╗")
+            output.append("║                 INFORMATIONS SYSTÈME                       ║")
+            output.append("╠════════════════════════════════════════════════════════════╣")
             
             # Informations de base
-            basic_info = [
-                ('Nom d\'hôte', system_data.get('hostname', 'Inconnu')),
-                ('Plateforme', system_data.get('platform', 'Inconnue')),
-                ('Utilisateur', system_data.get('username', 'Inconnu')),
-                ('Processeur', system_data.get('processor', 'Inconnu')),
-                ('Architecture', system_data.get('machine', 'Inconnue'))
-            ]
-            
-            for label, value in basic_info:
-                summary += f"{label:15s}: {value}\\n"
-            
-            # Informations réseau
-            if 'ip_address' in system_data:
-                summary += f"{'Adresse IP':15s}: {system_data['ip_address']}\\n"
-            
-            if 'mac_address' in system_data:
-                summary += f"{'Adresse MAC':15s}: {system_data['mac_address']}\\n"
-            
-            # Informations matérielles (si disponibles)
-            if 'cpu' in system_data:
-                cpu_info = system_data['cpu']
-                if isinstance(cpu_info, dict):
-                    cores = cpu_info.get('total_cores', 'Inconnu')
-                    usage = cpu_info.get('usage', 'Inconnu')
-                    summary += f"{'CPU Cores':15s}: {cores} (Usage: {usage})\\n"
-            
-            if 'memory' in system_data:
-                memory_info = system_data['memory']
-                if isinstance(memory_info, dict):
-                    total = memory_info.get('total', 'Inconnu')
-                    usage = memory_info.get('percentage', 'Inconnu')
-                    summary += f"{'Mémoire':15s}: {total} (Usage: {usage})\\n"
-            
-            # Notes de sécurité
-            if security_notes:
-                summary += "\\nAnalyse de sécurité:\\n"
-                summary += "-" * 20 + "\\n"
-                for key, note in security_notes.items():
-                    summary += f"{key:12s}: {note}\\n"
-            
-            return summary
-            
-        except Exception as e:
-            logger.error(f"Erreur formatage résumé: {e}")
-            return f"[!] Erreur lors du formatage du résumé: {e}"
-    
-    def list_connected_systems(self) -> str:
-        """Liste tous les systèmes analysés"""
-        try:
-            if not self.system_database:
-                return "Aucun système analysé"
-            
-            output = f"Systèmes analysés ({len(self.system_database)}):\\n"
-            output += "=" * 80 + "\\n"
-            
-            for session_id, info in self.system_database.items():
-                system_data = info['system_data']
-                last_updated = info['last_updated']
-                address = info['client_address']
-                
-                # Formatage des informations essentielles
-                hostname = system_data.get('hostname', 'Inconnu')
-                platform = system_data.get('platform', 'Inconnue')
-                username = system_data.get('username', 'Inconnu')
-                
-                output += (
-                    f"Session: {session_id}\\n"
-                    f"  Adresse: {address[0]}:{address[1]}\\n"
-                    f"  Hôte: {hostname} ({platform})\\n"
-                    f"  Utilisateur: {username}\\n"
-                    f"  Dernière MAJ: {last_updated.split('T')[0]}\\n"
-                    f"\\n"
-                )
-            
-            return output
-            
-        except Exception as e:
-            logger.error(f"Erreur dans list_connected_systems: {e}")
-            return f"[!] Erreur lors du listage: {e}"
-    
-    def get_system_details(self, session_id: str) -> str:
-        """Récupère les détails complets d'un système"""
-        try:
-            if session_id not in self.system_database:
-                return f"[!] Système non trouvé: {session_id}"
-            
-            info = self.system_database[session_id]
-            system_data = info['system_data']
-            
-            # Affichage détaillé en JSON formaté
-            output = f"Détails système - {session_id}\\n"
-            output += "=" * 60 + "\\n"
-            
-            # Informations formatées lisiblement
-            formatted_data = self._format_detailed_info(system_data)
-            output += formatted_data
-            
-            return output
-            
-        except Exception as e:
-            logger.error(f"Erreur dans get_system_details: {e}")
-            return f"[!] Erreur lors de la récupération: {e}"
-    
-    def _format_detailed_info(self, system_data: Dict[str, Any]) -> str:
-        """Formate les informations détaillées de manière lisible"""
-        try:
-            output = ""
-            
-            # Informations de base
-            if 'basic' in system_data:
-                basic = system_data['basic']
-                output += "INFORMATIONS DE BASE:\\n"
-                for key, value in basic.items():
-                    output += f"  {key:20s}: {value}\\n"
-                output += "\\n"
+            basic_info = system_data.get('basic', {})
+            if basic_info:
+                output.append("║ SYSTÈME DE BASE:                                          ║")
+                output.append(f"║   Hostname: {basic_info.get('hostname', 'N/A'):<43} ║")
+                output.append(f"║   Platform: {basic_info.get('platform', 'N/A'):<43} ║")
+                output.append(f"║   System: {basic_info.get('system', 'N/A'):<45} ║")
+                output.append(f"║   Release: {basic_info.get('release', 'N/A'):<44} ║")
+                output.append(f"║   Machine: {basic_info.get('machine', 'N/A'):<44} ║")
+                output.append(f"║   Username: {basic_info.get('username', 'N/A'):<43} ║")
+                output.append(f"║   IP Address: {basic_info.get('ip_address', 'N/A'):<41} ║")
+                output.append("╠════════════════════════════════════════════════════════════╣")
             
             # Informations matérielles
-            if 'hardware' in system_data:
-                hw = system_data['hardware']
-                output += "MATÉRIEL:\\n"
+            hardware_info = system_data.get('hardware', {})
+            if hardware_info:
+                output.append("║ MATÉRIEL:                                                  ║")
                 
-                if 'cpu' in hw:
-                    output += "  CPU:\\n"
-                    for key, value in hw['cpu'].items():
-                        output += f"    {key:18s}: {value}\\n"
+                # CPU
+                cpu_info = hardware_info.get('cpu', {})
+                if cpu_info:
+                    cores = f"{cpu_info.get('physical_cores', 'N/A')}/{cpu_info.get('total_cores', 'N/A')}"
+                    output.append(f"║   CPU Cores: {cores:<44} ║")
+                    output.append(f"║   CPU Usage: {cpu_info.get('usage', 'N/A'):<44} ║")
+                    freq = cpu_info.get('max_frequency', 'N/A')
+                    output.append(f"║   CPU Freq: {freq:<45} ║")
                 
-                if 'memory' in hw:
-                    output += "  Mémoire:\\n"
-                    for key, value in hw['memory'].items():
-                        output += f"    {key:18s}: {value}\\n"
+                # Mémoire
+                memory_info = hardware_info.get('memory', {})
+                if memory_info:
+                    output.append(f"║   RAM Total: {memory_info.get('total', 'N/A'):<43} ║")
+                    output.append(f"║   RAM Used: {memory_info.get('used', 'N/A'):<44} ║")
+                    output.append(f"║   RAM Usage: {memory_info.get('percentage', 'N/A'):<43} ║")
                 
-                if 'disks' in hw and hw['disks']:
-                    output += "  Disques:\\n"
-                    for i, disk in enumerate(hw['disks'], 1):
-                        output += f"    Disque {i}:\\n"
-                        for key, value in disk.items():
-                            output += f"      {key:16s}: {value}\\n"
-                
-                output += "\\n"
+                output.append("╠════════════════════════════════════════════════════════════╣")
             
             # Informations réseau
-            if 'network' in system_data:
-                net = system_data['network']
-                output += "RÉSEAU:\\n"
+            network_info = system_data.get('network', {})
+            if network_info:
+                output.append("║ RÉSEAU:                                                    ║")
                 
-                if 'interfaces' in net:
-                    output += "  Interfaces:\\n"
-                    for interface, addresses in net['interfaces'].items():
-                        output += f"    {interface}:\\n"
-                        for addr in addresses:
-                            if isinstance(addr, dict):
-                                for key, value in addr.items():
-                                    output += f"      {key:14s}: {value}\\n"
+                # Statistiques réseau
+                stats = network_info.get('statistics', {})
+                if stats:
+                    bytes_sent = self._format_bytes(stats.get('bytes_sent', 0))
+                    bytes_recv = self._format_bytes(stats.get('bytes_recv', 0))
+                    output.append(f"║   Bytes Sent: {bytes_sent:<43} ║")
+                    output.append(f"║   Bytes Recv: {bytes_recv:<43} ║")
                 
-                if 'statistics' in net:
-                    output += "  Statistiques:\\n"
-                    for key, value in net['statistics'].items():
-                        if isinstance(value, int):
-                            formatted_value = format_bytes(value) if 'bytes' in key else str(value)
-                        else:
-                            formatted_value = str(value)
-                        output += f"    {key:16s}: {formatted_value}\\n"
-                
-                output += "\\n"
+                output.append("╠════════════════════════════════════════════════════════════╣")
             
-            # Processus top (si disponible)
-            if 'processes' in system_data:
-                proc = system_data['processes']
-                output += f"PROCESSUS (Total: {proc.get('count', 'Inconnu')}):\\n"
+            # Informations de sécurité
+            security_info = system_data.get('security', {})
+            if security_info:
+                output.append("║ SÉCURITÉ:                                                  ║")
+                admin_status = "OUI" if security_info.get('is_admin') else "NON"
+                output.append(f"║   Admin: {admin_status:<48} ║")
                 
-                if 'top_cpu' in proc and proc['top_cpu']:
-                    output += "  Top CPU:\\n"
-                    for p in proc['top_cpu'][:5]:  # Top 5
-                        output += f"    {p['name']:20s} PID:{p['pid']:6d} CPU:{p['cpu_percent']}\\n"
+                antivirus = security_info.get('antivirus', [])
+                if antivirus:
+                    av_list = ", ".join(antivirus[:2])  # Maximum 2 AV affichés
+                    if len(av_list) > 45:
+                        av_list = av_list[:42] + "..."
+                    output.append(f"║   Antivirus: {av_list:<44} ║")
                 
-                if 'top_memory' in proc and proc['top_memory']:
-                    output += "  Top Mémoire:\\n"
-                    for p in proc['top_memory'][:5]:  # Top 5
-                        output += f"    {p['name']:20s} PID:{p['pid']:6d} MEM:{p['memory_percent']}\\n"
+                firewall = security_info.get('firewall', {})
+                if firewall:
+                    fw_status = firewall.get('status', 'unknown').upper()
+                    output.append(f"║   Firewall: {fw_status:<45} ║")
                 
-                output += "\\n"
+                output.append("╠════════════════════════════════════════════════════════════╣")
             
-            return output
+            # Processus top
+            process_info = system_data.get('processes', {})
+            if process_info:
+                output.append("║ PROCESSUS (TOP CPU):                                      ║")
+                
+                top_cpu = process_info.get('top_cpu', [])[:3]  # Top 3
+                for i, proc in enumerate(top_cpu, 1):
+                    name = proc.get('name', 'Unknown')[:15]
+                    cpu = proc.get('cpu_percent', 'N/A')
+                    output.append(f"║   {i}. {name:<15} - CPU: {cpu:<25} ║")
+                
+                if not top_cpu:
+                    output.append("║   Aucune information de processus disponible              ║")
+            
+            output.append("╚════════════════════════════════════════════════════════════╝")
+            
+            return "\\n".join(output)
             
         except Exception as e:
-            logger.warning(f"Erreur formatage détaillé: {e}")
-            return f"Erreur lors du formatage: {e}"
+            logger.error(f"Erreur formatage info système: {e}")
+            return f"[!] Erreur formatage: {e}\\n\\nDonnées brutes:\\n{system_data}"
     
-    def get_system_stats(self) -> str:
-        """Retourne les statistiques globales des systèmes"""
+    def _format_network_output(self, network_output: str) -> str:
+        """Formate la sortie de configuration réseau"""
         try:
-            output = f"""
-╔════════════════════════════════════════╗
-║        STATISTIQUES SYSTÈME           ║
-╠════════════════════════════════════════╣
-║ Systèmes analysés: {self.systems_analyzed:14d} ║
-║ Systèmes actifs: {len(self.system_database):16d} ║
-║ Plateformes uniques: {len(self.unique_platforms):11d} ║
-║ Utilisateurs uniques: {len(self.unique_users):10d} ║
-╚════════════════════════════════════════╝
-
-Plateformes détectées:"""
+            if not network_output:
+                return "[!] Aucune information réseau disponible"
             
-            for platform in sorted(self.unique_platforms):
-                output += f"\\n  - {platform}"
+            # Nettoyage de base
+            lines = network_output.strip().split('\\n')
             
-            output += "\\n\\nUtilisateurs détectés:"
-            for user in sorted(self.unique_users):
-                output += f"\\n  - {user}"
+            # En-tête
+            formatted_lines = []
+            formatted_lines.append("╔════════════════════════════════════════════════════════════╗")
+            formatted_lines.append("║                 CONFIGURATION RÉSEAU                      ║")
+            formatted_lines.append("╠════════════════════════════════════════════════════════════╣")
             
-            return output
+            # Traitement des lignes
+            for line in lines[:50]:  # Limitation à 50 lignes
+                if len(line) > 58:  # Largeur du tableau - 4 caractères pour les bordures
+                    line = line[:55] + "..."
+                
+                # Padding pour centrer dans le tableau
+                formatted_lines.append(f"║ {line:<58} ║")
+            
+            formatted_lines.append("╚════════════════════════════════════════════════════════════╝")
+            
+            return "\\n".join(formatted_lines)
             
         except Exception as e:
-            logger.error(f"Erreur dans get_system_stats: {e}")
-            return f"[!] Erreur lors de la récupération des statistiques: {e}"
+            logger.error(f"Erreur formatage réseau: {e}")
+            return f"[!] Erreur formatage réseau: {e}\\n\\n{network_output}"
     
-    def export_system_data(self, session_id: str = None, format: str = 'json') -> str:
+    def _format_bytes(self, byte_count: int) -> str:
+        """Formate une taille en bytes de manière lisible"""
+        try:
+            for unit in ['B', 'KB', 'MB', 'GB', 'TB']:
+                if byte_count < 1024.0:
+                    return f"{byte_count:.1f} {unit}"
+                byte_count /= 1024.0
+            return f"{byte_count:.1f} PB"
+        except:
+            return "N/A"
+    
+    def get_cached_system_info(self, session_id: str) -> Optional[Dict[str, Any]]:
         """
-        Exporte les données système
+        Récupère les informations système en cache
         
         Args:
-            session_id: ID de session spécifique (optionnel)
-            format: Format d'export ('json', 'txt')
-            
+            session_id: ID de la session
+        
         Returns:
-            str: Message de résultat
+            Dict ou None: Informations système ou None si pas en cache
+        """
+        return self.system_info_cache.get(session_id)
+    
+    def get_system_summary(self, session_id: str) -> str:
+        """
+        Génère un résumé système pour une session
+        
+        Args:
+            session_id: ID de la session
+        
+        Returns:
+            str: Résumé système formaté
         """
         try:
-            timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+            system_info = self.system_info_cache.get(session_id)
+            if not system_info:
+                return f"[!] Aucune information système disponible pour {session_id}"
             
-            if session_id:
-                if session_id not in self.system_database:
-                    return f"[!] Système non trouvé: {session_id}"
-                
-                data_to_export = {session_id: self.system_database[session_id]}
-                filename = f"system_data_{session_id[:8]}_{timestamp}.{format}"
-            else:
-                data_to_export = self.system_database
-                filename = f"system_data_all_{timestamp}.{format}"
+            basic = system_info.get('basic', {})
+            security = system_info.get('security', {})
             
-            export_path = self.data_dir / filename
+            summary_parts = []
             
-            if format == 'json':
-                with open(export_path, 'w', encoding='utf-8') as f:
-                    json.dump(data_to_export, f, indent=2, ensure_ascii=False)
-            elif format == 'txt':
-                with open(export_path, 'w', encoding='utf-8') as f:
-                    f.write(f"# System Data Export\\n")
-                    f.write(f"# Generated: {datetime.now().isoformat()}\\n\\n")
-                    
-                    for sid, info in data_to_export.items():
-                        f.write(f"Session: {sid}\\n")
-                        f.write("=" * 50 + "\\n")
-                        f.write(self._format_detailed_info(info['system_data']))
-                        f.write("\\n" + "-" * 50 + "\\n\\n")
-            else:
-                return f"[!] Format non supporté: {format}"
+            # Informations de base
+            hostname = basic.get('hostname', 'Unknown')
+            platform = basic.get('platform', 'Unknown')
+            username = basic.get('username', 'Unknown')
+            ip_addr = basic.get('ip_address', 'Unknown')
             
-            return f"[+] Données exportées: {filename}"
+            summary_parts.append(f"Host: {hostname} ({ip_addr})")
+            summary_parts.append(f"OS: {platform}")
+            summary_parts.append(f"User: {username}")
+            
+            # Statut admin
+            is_admin = security.get('is_admin', False)
+            admin_status = "Admin" if is_admin else "User"
+            summary_parts.append(f"Privileges: {admin_status}")
+            
+            # Antivirus
+            antivirus = security.get('antivirus', [])
+            if antivirus:
+                av_name = antivirus[0] if len(antivirus) == 1 else f"{len(antivirus)} AV detected"
+                summary_parts.append(f"AV: {av_name}")
+            
+            return " | ".join(summary_parts)
             
         except Exception as e:
-            logger.error(f"Erreur dans export_system_data: {e}")
-            return f"[!] Erreur lors de l'export: {e}"
+            logger.error(f"Erreur génération résumé: {e}")
+            return f"[!] Erreur résumé pour {session_id}"
     
-    def cleanup_old_data(self, days: int = 30) -> str:
-        """Nettoie les anciennes données système"""
+    def compare_system_info(self, session_id_1: str, session_id_2: str) -> str:
+        """
+        Compare les informations système de deux sessions
+        
+        Args:
+            session_id_1: ID de la première session
+            session_id_2: ID de la deuxième session
+        
+        Returns:
+            str: Comparaison formatée
+        """
         try:
-            cutoff_time = datetime.now().timestamp() - (days * 24 * 3600)
-            cleaned_files = 0
+            info1 = self.system_info_cache.get(session_id_1)
+            info2 = self.system_info_cache.get(session_id_2)
             
-            for file_path in self.data_dir.glob("*_sysinfo.json"):
-                if file_path.stat().st_mtime < cutoff_time:
-                    file_path.unlink()
-                    cleaned_files += 1
+            if not info1 or not info2:
+                return "[!] Informations manquantes pour la comparaison"
             
-            return f"[+] Nettoyage terminé: {cleaned_files} fichiers supprimés"
+            comparison = []
+            comparison.append("╔════════════════════════════════════════════════════════════╗")
+            comparison.append("║                 COMPARAISON SYSTÈME                       ║")
+            comparison.append("╠════════════════════════════════════════════════════════════╣")
+            
+            # Comparaison des champs de base
+            basic1 = info1.get('basic', {})
+            basic2 = info2.get('basic', {})
+            
+            fields_to_compare = [
+                ('hostname', 'Hostname'),
+                ('platform', 'Platform'),
+                ('system', 'System'),
+                ('username', 'Username'),
+                ('ip_address', 'IP Address')
+            ]
+            
+            for field, label in fields_to_compare:
+                val1 = basic1.get(field, 'N/A')
+                val2 = basic2.get(field, 'N/A')
+                
+                if val1 == val2:
+                    status = "✓ Identique"
+                else:
+                    status = "✗ Différent"
+                
+                comparison.append(f"║ {label}:")
+                comparison.append(f"║   {session_id_1}: {val1[:35]}")
+                comparison.append(f"║   {session_id_2}: {val2[:35]}")
+                comparison.append(f"║   Statut: {status}")
+                comparison.append("║")
+            
+            comparison.append("╚════════════════════════════════════════════════════════════╝")
+            
+            return "\\n".join(comparison)
             
         except Exception as e:
-            logger.error(f"Erreur dans cleanup_old_data: {e}")
-            return f"[!] Erreur lors du nettoyage: {e}"
+            logger.error(f"Erreur comparaison système: {e}")
+            return f"[!] Erreur lors de la comparaison: {e}"
+    
+    def get_statistics(self) -> Dict[str, Any]:
+        """Retourne les statistiques du gestionnaire système"""
+        return {
+            'info_requests': self.info_requests,
+            'cached_sessions': len(self.system_info_cache),
+            'last_updates': len(self.last_update)
+        }
+    
+    def clear_cache(self, session_id: str = None) -> int:
+        """
+        Efface le cache des informations système
+        
+        Args:
+            session_id: ID de session (None = tout le cache)
+        
+        Returns:
+            int: Nombre d'entrées supprimées
+        """
+        try:
+            if session_id:
+                # Suppression pour une session spécifique
+                deleted = 0
+                if session_id in self.system_info_cache:
+                    del self.system_info_cache[session_id]
+                    deleted += 1
+                if session_id in self.last_update:
+                    del self.last_update[session_id]
+                
+                return deleted
+            else:
+                # Suppression complète
+                deleted = len(self.system_info_cache)
+                self.system_info_cache.clear()
+                self.last_update.clear()
+                
+                return deleted
+                
+        except Exception as e:
+            logger.error(f"Erreur effacement cache: {e}")
+            return 0
+    
+    def export_system_info(self, filepath: str, session_id: str = None) -> bool:
+        """
+        Exporte les informations système vers un fichier
+        
+        Args:
+            filepath: Chemin du fichier d'export
+            session_id: ID de session (None = toutes les sessions)
+        
+        Returns:
+            bool: True si succès
+        """
+        try:
+            # Données à exporter
+            if session_id:
+                if session_id not in self.system_info_cache:
+                    return False
+                export_data = {session_id: self.system_info_cache[session_id]}
+            else:
+                export_data = self.system_info_cache.copy()
+            
+            # Ajout des métadonnées
+            export_with_meta = {
+                'export_timestamp': datetime.now().isoformat(),
+                'session_filter': session_id,
+                'total_sessions': len(export_data),
+                'system_info': export_data
+            }
+            
+            # Sauvegarde
+            with open(filepath, 'w', encoding='utf-8') as f:
+                json.dump(export_with_meta, f, indent=2, ensure_ascii=False)
+            
+            logger.info(f"Informations système exportées: {len(export_data)} sessions vers {filepath}")
+            return True
+            
+        except Exception as e:
+            logger.error(f"Erreur export système: {e}")
+            return False

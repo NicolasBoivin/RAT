@@ -1,373 +1,529 @@
 """
-Server Crypto - Gestion du chiffrement côté serveur
-SSL/TLS et chiffrement des communications
+SSL Context Manager - Gestionnaire SSL/TLS pour le serveur RAT
+Gestion des certificats et contextes SSL sécurisés
 """
 
 import ssl
-import socket
 import os
+import socket
 from pathlib import Path
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, Tuple
 import logging
 
+try:
+    from cryptography import x509
+    from cryptography.hazmat.primitives import serialization, hashes
+    from cryptography.hazmat.primitives.asymmetric import rsa
+    from cryptography.x509.oid import NameOID
+    from datetime import datetime, timedelta
+    CRYPTOGRAPHY_AVAILABLE = True
+except ImportError:
+    CRYPTOGRAPHY_AVAILABLE = False
+
 from server.utils.config import ServerConfig
-from shared.exceptions import EncryptionError
+from shared.exceptions import SecurityException
 
 logger = logging.getLogger(__name__)
 
 class SSLContextManager:
-    """Gestionnaire du contexte SSL pour le serveur"""
+    """Gestionnaire de contexte SSL pour le serveur"""
     
     def __init__(self, config: ServerConfig):
         self.config = config
         self.ssl_context = None
-        self._setup_ssl_context()
+        self.certificates_info = {}
+        
+        # Configuration SSL si activé
+        if config.USE_SSL:
+            self._setup_ssl_context()
+        
+        logger.info("SSLContextManager initialisé")
     
     def _setup_ssl_context(self):
-        """Configure le contexte SSL"""
+        """Configure le contexte SSL du serveur"""
         try:
-            # Création du contexte SSL côté serveur
+            # Création du contexte SSL serveur
             self.ssl_context = ssl.create_default_context(ssl.Purpose.CLIENT_AUTH)
             
-            # Configuration des certificats
-            ssl_config = self.config.get_ssl_config()
-            cert_file = ssl_config['cert_file']
-            key_file = ssl_config['key_file']
-            
-            # Vérification de l'existence des fichiers
-            if not Path(cert_file).exists():
-                raise EncryptionError(f"Certificat SSL non trouvé: {cert_file}")
-            
-            if not Path(key_file).exists():
-                raise EncryptionError(f"Clé privée SSL non trouvée: {key_file}")
-            
-            # Chargement des certificats
-            self.ssl_context.load_cert_chain(cert_file, key_file)
-            
-            # Configuration de sécurité
+            # Configuration des protocoles sécurisés
             self.ssl_context.minimum_version = ssl.TLSVersion.TLSv1_2
             self.ssl_context.maximum_version = ssl.TLSVersion.TLSv1_3
             
-            # Désactivation de la vérification du nom d'hôte (environnement de test)
-            if self.config.debug:
-                self.ssl_context.check_hostname = False
+            # Configuration des ciphers sécurisés
+            self.ssl_context.set_ciphers([
+                'ECDHE+AESGCM',
+                'ECDHE+CHACHA20',
+                'DHE+AESGCM',
+                'DHE+CHACHA20',
+                '!aNULL',
+                '!MD5',
+                '!DSS',
+                '!RC4'
+            ])
+            
+            # Chargement des certificats
+            if not self._load_certificates():
+                raise SecurityException("Impossible de charger les certificats SSL")
+            
+            # Configuration de la vérification client si demandée
+            if self.config.SSL_VERIFY_CLIENT:
+                self.ssl_context.verify_mode = ssl.CERT_REQUIRED
+                if self.config.SSL_CA_FILE and os.path.exists(self.config.SSL_CA_FILE):
+                    self.ssl_context.load_verify_locations(self.config.SSL_CA_FILE)
+            else:
                 self.ssl_context.verify_mode = ssl.CERT_NONE
             
-            # Configuration des ciphers sécurisés
-            self.ssl_context.set_ciphers('ECDHE+AESGCM:ECDHE+CHACHA20:DHE+AESGCM:DHE+CHACHA20:!aNULL:!MD5:!DSS')
+            # Configuration des options SSL
+            self.ssl_context.options |= ssl.OP_NO_SSLv2
+            self.ssl_context.options |= ssl.OP_NO_SSLv3
+            self.ssl_context.options |= ssl.OP_NO_COMPRESSION
+            self.ssl_context.options |= ssl.OP_CIPHER_SERVER_PREFERENCE
             
-            logger.info("Contexte SSL configuré avec succès")
+            # Désactivation du renegotiation pour la sécurité
+            self.ssl_context.options |= getattr(ssl, 'OP_NO_RENEGOTIATION', 0)
+            
+            logger.info("Contexte SSL serveur configuré avec succès")
             
         except Exception as e:
             logger.error(f"Erreur configuration SSL: {e}")
-            raise EncryptionError(f"Impossible de configurer SSL: {e}")
+            raise SecurityException(f"Impossible de configurer SSL: {e}")
     
-    def wrap_socket(self, socket_obj: socket.socket) -> ssl.SSLSocket:
+    def _load_certificates(self) -> bool:
+        """Charge les certificats SSL"""
+        try:
+            # Vérification de la présence des fichiers requis
+            if not self.config.SSL_CERT_FILE or not os.path.exists(self.config.SSL_CERT_FILE):
+                logger.error(f"Certificat SSL non trouvé: {self.config.SSL_CERT_FILE}")
+                
+                # Tentative de génération automatique
+                if self._auto_generate_certificates():
+                    logger.info("Certificats auto-générés utilisés")
+                else:
+                    return False
+            
+            if not self.config.SSL_KEY_FILE or not os.path.exists(self.config.SSL_KEY_FILE):
+                logger.error(f"Clé privée SSL non trouvée: {self.config.SSL_KEY_FILE}")
+                return False
+            
+            # Chargement des certificats dans le contexte SSL
+            self.ssl_context.load_cert_chain(
+                certfile=self.config.SSL_CERT_FILE,
+                keyfile=self.config.SSL_KEY_FILE
+            )
+            
+            # Lecture des informations des certificats
+            self._read_certificate_info()
+            
+            logger.info("Certificats SSL chargés avec succès")
+            return True
+            
+        except Exception as e:
+            logger.error(f"Erreur chargement certificats: {e}")
+            return False
+    
+    def _auto_generate_certificates(self) -> bool:
+        """Génère automatiquement des certificats auto-signés"""
+        try:
+            if not CRYPTOGRAPHY_AVAILABLE:
+                logger.error("Cryptography non disponible - impossible de générer les certificats")
+                return False
+            
+            logger.info("Génération automatique des certificats SSL...")
+            
+            # Génération de la clé privée
+            private_key = rsa.generate_private_key(
+                public_exponent=65537,
+                key_size=2048,
+            )
+            
+            # Création du certificat auto-signé
+            subject = issuer = x509.Name([
+                x509.NameAttribute(NameOID.COUNTRY_NAME, "FR"),
+                x509.NameAttribute(NameOID.STATE_OR_PROVINCE_NAME, "Ile-de-France"),
+                x509.NameAttribute(NameOID.LOCALITY_NAME, "Paris"),
+                x509.NameAttribute(NameOID.ORGANIZATION_NAME, "RAT Project Academic"),
+                x509.NameAttribute(NameOID.COMMON_NAME, "RAT Server"),
+            ])
+            
+            cert = x509.CertificateBuilder().subject_name(
+                subject
+            ).issuer_name(
+                issuer
+            ).public_key(
+                private_key.public_key()
+            ).serial_number(
+                x509.random_serial_number()
+            ).not_valid_before(
+                datetime.utcnow()
+            ).not_valid_after(
+                datetime.utcnow() + timedelta(days=365)
+            ).add_extension(
+                x509.SubjectAlternativeName([
+                    x509.DNSName("localhost"),
+                    x509.DNSName("rat-server"),
+                    x509.IPAddress(ipaddress.IPv4Address("127.0.0.1")),
+                    x509.IPAddress(ipaddress.IPv4Address("0.0.0.0")),
+                ]),
+                critical=False,
+            ).sign(private_key, hashes.SHA256())
+            
+            # Création du répertoire SSL
+            ssl_dir = Path(self.config.DATA_DIR) / "ssl"
+            ssl_dir.mkdir(parents=True, exist_ok=True)
+            
+            # Sauvegarde de la clé privée
+            key_file = ssl_dir / "server-key.pem"
+            with open(key_file, "wb") as f:
+                f.write(private_key.private_bytes(
+                    encoding=serialization.Encoding.PEM,
+                    format=serialization.PrivateFormat.PKCS8,
+                    encryption_algorithm=serialization.NoEncryption()
+                ))
+            
+            # Sauvegarde du certificat
+            cert_file = ssl_dir / "server-cert.pem"
+            with open(cert_file, "wb") as f:
+                f.write(cert.public_bytes(serialization.Encoding.PEM))
+            
+            # Mise à jour de la configuration
+            self.config.SSL_CERT_FILE = str(cert_file)
+            self.config.SSL_KEY_FILE = str(key_file)
+            
+            # Importation d'ipaddress pour l'utilisation ci-dessus
+            import ipaddress  
+            
+            logger.info(f"Certificats générés: {cert_file}, {key_file}")
+            return True
+            
+        except Exception as e:
+            logger.error(f"Erreur génération certificats: {e}")
+            return False
+    
+    def _read_certificate_info(self):
+        """Lit les informations des certificats chargés"""
+        try:
+            if not CRYPTOGRAPHY_AVAILABLE:
+                return
+            
+            # Lecture du certificat
+            with open(self.config.SSL_CERT_FILE, 'rb') as f:
+                cert_data = f.read()
+                cert = x509.load_pem_x509_certificate(cert_data)
+            
+            # Extraction des informations
+            self.certificates_info = {
+                'subject': cert.subject.rfc4514_string(),
+                'issuer': cert.issuer.rfc4514_string(),
+                'serial_number': str(cert.serial_number),
+                'not_valid_before': cert.not_valid_before.isoformat(),
+                'not_valid_after': cert.not_valid_after.isoformat(),
+                'signature_algorithm': cert.signature_algorithm_oid._name,
+                'version': cert.version.name,
+                'is_ca': False
+            }
+            
+            # Vérification si c'est un certificat CA
+            try:
+                basic_constraints = cert.extensions.get_extension_for_oid(
+                    x509.oid.ExtensionOID.BASIC_CONSTRAINTS
+                ).value
+                self.certificates_info['is_ca'] = basic_constraints.ca
+            except x509.ExtensionNotFound:
+                pass
+            
+            # Extraction des noms alternatifs
+            try:
+                san = cert.extensions.get_extension_for_oid(
+                    x509.oid.ExtensionOID.SUBJECT_ALTERNATIVE_NAME
+                ).value
+                alt_names = []
+                for name in san:
+                    alt_names.append(str(name))
+                self.certificates_info['alternative_names'] = alt_names
+            except x509.ExtensionNotFound:
+                self.certificates_info['alternative_names'] = []
+            
+            # Vérification de l'expiration
+            now = datetime.utcnow()
+            self.certificates_info['is_expired'] = cert.not_valid_after < now
+            self.certificates_info['expires_soon'] = (cert.not_valid_after - now).days < 30
+            
+            logger.debug("Informations de certificat lues")
+            
+        except Exception as e:
+            logger.error(f"Erreur lecture certificat: {e}")
+    
+    def wrap_client_socket(self, client_socket: socket.socket) -> ssl.SSLSocket:
         """
-        Enveloppe une socket avec SSL
+        Enveloppe un socket client avec SSL
         
         Args:
-            socket_obj: Socket à envelopper
-            
+            client_socket: Socket client à envelopper
+        
         Returns:
             ssl.SSLSocket: Socket SSL
         """
         try:
             if not self.ssl_context:
-                raise EncryptionError("Contexte SSL non initialisé")
+                raise SecurityException("Contexte SSL non configuré")
             
+            # Enveloppement SSL côté serveur
             ssl_socket = self.ssl_context.wrap_socket(
-                socket_obj,
-                server_side=True,
-                do_handshake_on_connect=False
+                client_socket,
+                server_side=True
             )
             
+            logger.debug("Socket client enveloppé avec SSL")
             return ssl_socket
             
         except Exception as e:
-            logger.error(f"Erreur enveloppement SSL: {e}")
-            raise EncryptionError(f"Impossible d'envelopper la socket: {e}")
-    
-    def wrap_client_socket(self, client_socket: socket.socket) -> ssl.SSLSocket:
-        """
-        Enveloppe une socket client avec SSL et effectue le handshake
-        
-        Args:
-            client_socket: Socket client à envelopper
-            
-        Returns:
-            ssl.SSLSocket: Socket SSL client
-        """
-        try:
-            ssl_client = self.wrap_socket(client_socket)
-            
-            # Handshake SSL
-            ssl_client.do_handshake()
-            
-            # Informations sur la connexion SSL
-            cipher = ssl_client.cipher()
-            if cipher:
-                logger.debug(f"Connexion SSL établie: {cipher[0]} ({cipher[1]} bits)")
-            
-            return ssl_client
-            
-        except ssl.SSLError as e:
-            logger.error(f"Erreur SSL handshake: {e}")
-            raise EncryptionError(f"Échec du handshake SSL: {e}")
-        except Exception as e:
-            logger.error(f"Erreur enveloppement client SSL: {e}")
-            raise EncryptionError(f"Impossible d'envelopper la socket client: {e}")
+            logger.error(f"Erreur enveloppement SSL client: {e}")
+            raise SecurityException(f"Impossible d'établir la connexion SSL: {e}")
     
     def get_ssl_info(self) -> Dict[str, Any]:
-        """Retourne les informations SSL"""
+        """
+        Récupère les informations SSL du serveur
+        
+        Returns:
+            Dict: Informations SSL
+        """
         try:
-            if not self.ssl_context:
-                return {'error': 'Contexte SSL non initialisé'}
-            
-            ssl_config = self.config.get_ssl_config()
-            
-            return {
-                'ssl_enabled': True,
-                'cert_file': ssl_config['cert_file'],
-                'key_file': ssl_config['key_file'],
-                'ca_file': ssl_config.get('ca_file'),
-                'minimum_version': str(self.ssl_context.minimum_version),
-                'maximum_version': str(self.ssl_context.maximum_version),
-                'verify_mode': str(self.ssl_context.verify_mode),
-                'check_hostname': self.ssl_context.check_hostname
+            info = {
+                'ssl_enabled': self.config.USE_SSL,
+                'ssl_context_configured': self.ssl_context is not None,
+                'cert_file': self.config.SSL_CERT_FILE,
+                'key_file': self.config.SSL_KEY_FILE,
+                'ca_file': self.config.SSL_CA_FILE,
+                'verify_client': self.config.SSL_VERIFY_CLIENT
             }
+            
+            if self.ssl_context:
+                info.update({
+                    'minimum_version': str(self.ssl_context.minimum_version),
+                    'maximum_version': str(self.ssl_context.maximum_version),
+                    'verify_mode': str(self.ssl_context.verify_mode),
+                    'ciphers': self._get_available_ciphers()
+                })
+            
+            if self.certificates_info:
+                info['certificate'] = self.certificates_info
+            
+            return info
             
         except Exception as e:
             logger.error(f"Erreur récupération info SSL: {e}")
             return {'error': str(e)}
     
-    def validate_certificates(self) -> Dict[str, bool]:
-        """Valide les certificats SSL"""
+    def _get_available_ciphers(self) -> List[str]:
+        """Récupère la liste des ciphers disponibles"""
         try:
-            ssl_config = self.config.get_ssl_config()
-            validation_results = {}
-            
-            # Vérification des fichiers
-            cert_file = Path(ssl_config['cert_file'])
-            key_file = Path(ssl_config['key_file'])
-            ca_file = Path(ssl_config.get('ca_file', ''))
-            
-            validation_results['cert_exists'] = cert_file.exists()
-            validation_results['key_exists'] = key_file.exists()
-            validation_results['ca_exists'] = ca_file.exists() if ssl_config.get('ca_file') else True
-            
-            # Vérification de la validité des certificats
-            if validation_results['cert_exists'] and validation_results['key_exists']:
+            if self.ssl_context:
+                # Création d'un socket temporaire pour tester les ciphers
+                temp_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                temp_socket.bind(('localhost', 0))
+                temp_socket.listen(1)
+                
                 try:
-                    # Test de chargement des certificats
-                    test_context = ssl.create_default_context(ssl.Purpose.CLIENT_AUTH)
-                    test_context.load_cert_chain(str(cert_file), str(key_file))
-                    validation_results['cert_valid'] = True
-                except Exception as e:
-                    logger.warning(f"Certificat invalide: {e}")
-                    validation_results['cert_valid'] = False
-            else:
-                validation_results['cert_valid'] = False
+                    ssl_socket = self.ssl_context.wrap_socket(temp_socket, server_side=True)
+                    ciphers = ssl_socket.cipher()
+                    return [ciphers] if ciphers else []
+                finally:
+                    temp_socket.close()
             
-            return validation_results
+            return []
+            
+        except Exception:
+            return []
+    
+    def validate_certificates(self) -> Dict[str, Any]:
+        """
+        Valide les certificats SSL
+        
+        Returns:
+            Dict: Résultat de la validation
+        """
+        try:
+            validation_result = {
+                'valid': True,
+                'errors': [],
+                'warnings': [],
+                'certificate_info': self.certificates_info
+            }
+            
+            if not self.certificates_info:
+                validation_result['valid'] = False
+                validation_result['errors'].append("Aucune information de certificat disponible")
+                return validation_result
+            
+            # Vérification de l'expiration
+            if self.certificates_info.get('is_expired'):
+                validation_result['valid'] = False
+                validation_result['errors'].append("Le certificat a expiré")
+            elif self.certificates_info.get('expires_soon'):
+                validation_result['warnings'].append("Le certificat expire dans moins de 30 jours")
+            
+            # Vérification de la taille de clé (si possible)
+            if CRYPTOGRAPHY_AVAILABLE:
+                try:
+                    with open(self.config.SSL_CERT_FILE, 'rb') as f:
+                        cert_data = f.read()
+                        cert = x509.load_pem_x509_certificate(cert_data)
+                        
+                        public_key = cert.public_key()
+                        if hasattr(public_key, 'key_size'):
+                            key_size = public_key.key_size
+                            if key_size < 2048:
+                                validation_result['warnings'].append(f"Taille de clé faible: {key_size} bits")
+                            validation_result['key_size'] = key_size
+                except Exception as e:
+                    validation_result['warnings'].append(f"Impossible de vérifier la taille de clé: {e}")
+            
+            # Vérification des algorithmes
+            if 'signature_algorithm' in self.certificates_info:
+                sig_alg = self.certificates_info['signature_algorithm']
+                weak_algorithms = ['md5', 'sha1']
+                
+                if any(weak_alg in sig_alg.lower() for weak_alg in weak_algorithms):
+                    validation_result['warnings'].append(f"Algorithme de signature faible: {sig_alg}")
+            
+            return validation_result
             
         except Exception as e:
             logger.error(f"Erreur validation certificats: {e}")
-            return {'error': str(e)}
-
-class ServerCryptoManager:
-    """Gestionnaire de chiffrement pour le serveur"""
-    
-    def __init__(self, config: ServerConfig):
-        self.config = config
-        self.ssl_manager = None
-        
-        if config.network.use_ssl:
-            self.ssl_manager = SSLContextManager(config)
-    
-    def is_ssl_enabled(self) -> bool:
-        """Vérifie si SSL est activé"""
-        return self.ssl_manager is not None
-    
-    def wrap_server_socket(self, server_socket: socket.socket) -> socket.socket:
-        """Enveloppe la socket serveur avec SSL si activé"""
-        if self.ssl_manager:
-            return self.ssl_manager.wrap_socket(server_socket)
-        return server_socket
-    
-    def wrap_client_connection(self, client_socket: socket.socket) -> socket.socket:
-        """Enveloppe une connexion client avec SSL si activé"""
-        if self.ssl_manager:
-            return self.ssl_manager.wrap_client_socket(client_socket)
-        return client_socket
-    
-    def get_crypto_info(self) -> Dict[str, Any]:
-        """Retourne les informations de chiffrement"""
-        info = {
-            'ssl_enabled': self.is_ssl_enabled(),
-            'encryption_type': 'SSL/TLS' if self.is_ssl_enabled() else 'None'
-        }
-        
-        if self.ssl_manager:
-            info.update(self.ssl_manager.get_ssl_info())
-        
-        return info
-    
-    def validate_crypto_config(self) -> Dict[str, Any]:
-        """Valide la configuration de chiffrement"""
-        if not self.is_ssl_enabled():
             return {
-                'valid': True,
-                'warnings': ['SSL désactivé - communications non chiffrées']
+                'valid': False,
+                'errors': [f"Erreur lors de la validation: {e}"],
+                'warnings': []
             }
-        
-        validation = self.ssl_manager.validate_certificates()
-        warnings = []
-        errors = []
-        
-        if not validation.get('cert_exists', False):
-            errors.append('Fichier certificat manquant')
-        
-        if not validation.get('key_exists', False):
-            errors.append('Fichier clé privée manquant')
-        
-        if not validation.get('cert_valid', False):
-            errors.append('Certificat ou clé privée invalide')
-        
-        if self.config.debug:
-            warnings.append('Mode debug actif - vérifications SSL allégées')
-        
-        return {
-            'valid': len(errors) == 0,
-            'errors': errors,
-            'warnings': warnings,
-            'validation_details': validation
-        }
-
-def generate_ssl_certificates(output_dir: str = "server/data/ssl") -> bool:
-    """
-    Génère des certificats SSL auto-signés pour le développement
     
-    Args:
-        output_dir: Répertoire de sortie
+    def renew_certificates(self) -> bool:
+        """
+        Renouvelle les certificats SSL (génère de nouveaux certificats auto-signés)
         
-    Returns:
-        bool: True si succès
-    """
-    try:
-        from cryptography import x509
-        from cryptography.x509.oid import NameOID
-        from cryptography.hazmat.primitives import hashes, serialization
-        from cryptography.hazmat.primitives.asymmetric import rsa
-        from datetime import datetime, timedelta
-        import ipaddress
-        
-        # Création du répertoire
-        output_path = Path(output_dir)
-        output_path.mkdir(parents=True, exist_ok=True)
-        
-        # Génération de la clé privée
-        private_key = rsa.generate_private_key(
-            public_exponent=65537,
-            key_size=2048,
-        )
-        
-        # Informations du certificat
-        subject = issuer = x509.Name([
-            x509.NameAttribute(NameOID.COUNTRY_NAME, "FR"),
-            x509.NameAttribute(NameOID.STATE_OR_PROVINCE_NAME, "Ile-de-France"),
-            x509.NameAttribute(NameOID.LOCALITY_NAME, "Paris"),
-            x509.NameAttribute(NameOID.ORGANIZATION_NAME, "RAT Project Dev"),
-            x509.NameAttribute(NameOID.COMMON_NAME, "localhost"),
-        ])
-        
-        # Création du certificat
-        cert = x509.CertificateBuilder().subject_name(
-            subject
-        ).issuer_name(
-            issuer
-        ).public_key(
-            private_key.public_key()
-        ).serial_number(
-            x509.random_serial_number()
-        ).not_valid_before(
-            datetime.utcnow()
-        ).not_valid_after(
-            datetime.utcnow() + timedelta(days=365)
-        ).add_extension(
-            x509.SubjectAlternativeName([
-                x509.DNSName("localhost"),
-                x509.DNSName("127.0.0.1"),
-                x509.IPAddress(ipaddress.IPv4Address("127.0.0.1")),
-                x509.IPAddress(ipaddress.IPv4Address("0.0.0.0")),
-            ]),
-            critical=False,
-        ).sign(private_key, hashes.SHA256())
-        
-        # Sauvegarde de la clé privée
-        key_file = output_path / "server-private-key.pem"
-        with open(key_file, "wb") as f:
-            f.write(private_key.private_bytes(
-                encoding=serialization.Encoding.PEM,
-                format=serialization.PrivateFormat.PKCS8,
-                encryption_algorithm=serialization.NoEncryption()
-            ))
-        
-        # Sauvegarde du certificat
-        cert_file = output_path / "server-certificate.pem"
-        with open(cert_file, "wb") as f:
-            f.write(cert.public_bytes(serialization.Encoding.PEM))
-        
-        # Sauvegarde du certificat CA (même certificat pour le développement)
-        ca_file = output_path / "ca-certificate.pem"
-        with open(ca_file, "wb") as f:
-            f.write(cert.public_bytes(serialization.Encoding.PEM))
-        
-        logger.info(f"Certificats SSL générés dans: {output_path}")
-        return True
-        
-    except ImportError:
-        logger.error("Module cryptography requis pour générer les certificats")
-        return False
-    except Exception as e:
-        logger.error(f"Erreur génération certificats: {e}")
-        return False
-
-def test_ssl_connection(host: str = "localhost", port: int = 8888, timeout: int = 5) -> Dict[str, Any]:
-    """
-    Test une connexion SSL
+        Returns:
+            bool: True si le renouvellement a réussi
+        """
+        try:
+            logger.info("Renouvellement des certificats SSL...")
+            
+            # Sauvegarde des anciens certificats
+            if os.path.exists(self.config.SSL_CERT_FILE):
+                backup_cert = self.config.SSL_CERT_FILE + '.backup'
+                shutil.copy2(self.config.SSL_CERT_FILE, backup_cert)
+                logger.info(f"Ancien certificat sauvegardé: {backup_cert}")
+            
+            if os.path.exists(self.config.SSL_KEY_FILE):
+                backup_key = self.config.SSL_KEY_FILE + '.backup'
+                shutil.copy2(self.config.SSL_KEY_FILE, backup_key)
+                logger.info(f"Ancienne clé sauvegardée: {backup_key}")
+            
+            # Génération de nouveaux certificats
+            if self._auto_generate_certificates():
+                # Rechargement du contexte SSL
+                self._setup_ssl_context()
+                logger.info("Certificats renouvelés avec succès")
+                return True
+            else:
+                logger.error("Échec du renouvellement des certificats")
+                return False
+                
+        except Exception as e:
+            logger.error(f"Erreur renouvellement certificats: {e}")
+            return False
     
-    Args:
-        host: Hôte à tester
-        port: Port à tester
-        timeout: Timeout en secondes
+    def test_ssl_configuration(self) -> Dict[str, Any]:
+        """
+        Teste la configuration SSL
         
-    Returns:
-        Dict: Résultats du test
-    """
-    try:
-        # Création du contexte SSL client
-        context = ssl.create_default_context()
-        context.check_hostname = False
-        context.verify_mode = ssl.CERT_NONE
+        Returns:
+            Dict: Résultat du test
+        """
+        try:
+            test_result = {
+                'success': False,
+                'ssl_context': self.ssl_context is not None,
+                'certificates_loaded': bool(self.certificates_info),
+                'errors': []
+            }
+            
+            if not self.ssl_context:
+                test_result['errors'].append("Contexte SSL non configuré")
+                return test_result
+            
+            # Test de création d'un socket SSL
+            try:
+                test_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                test_socket.bind(('localhost', 0))
+                test_socket.listen(1)
+                
+                # Test d'enveloppement SSL
+                ssl_socket = self.ssl_context.wrap_socket(test_socket, server_side=True)
+                
+                test_result['bind_port'] = test_socket.getsockname()[1]
+                test_result['success'] = True
+                
+                ssl_socket.close()
+                test_socket.close()
+                
+            except Exception as e:
+                test_result['errors'].append(f"Erreur test socket SSL: {e}")
+            
+            # Validation des certificats
+            cert_validation = self.validate_certificates()
+            test_result['certificate_validation'] = cert_validation
+            
+            if not cert_validation['valid']:
+                test_result['errors'].extend(cert_validation['errors'])
+            
+            return test_result
+            
+        except Exception as e:
+            logger.error(f"Erreur test SSL: {e}")
+            return {
+                'success': False,
+                'errors': [f"Erreur lors du test: {e}"]
+            }
+    
+    def get_connection_info(self, ssl_socket: ssl.SSLSocket) -> Dict[str, Any]:
+        """
+        Récupère les informations d'une connexion SSL
         
-        # Test de connexion
-        with socket.create_connection((host, port), timeout) as sock:
-            with context.wrap_socket(sock, server_hostname=host) as ssock:
-                # Informations sur la connexion
-                cipher = ssock.cipher()
-                cert = ssock.getpeercert()
-                
-                return {
-                    'success': True,
-                    'cipher': cipher[0] if cipher else None,
-                    'protocol': ssock.version(),
-                    'certificate_subject': cert.get('subject') if cert else None
-                }
-                
-    except socket.timeout:
-        return {'success': False, 'error': 'Timeout de connexion'}
-    except ssl.SSLError as e:
-        return {'success': False, 'error': f'Erreur SSL: {e}'}
-    except Exception as e:
-        return {'success': False, 'error': f'Erreur: {e}'}
+        Args:
+            ssl_socket: Socket SSL connecté
+        
+        Returns:
+            Dict: Informations de connexion
+        """
+        try:
+            return {
+                'cipher': ssl_socket.cipher(),
+                'peer_certificate': ssl_socket.getpeercert(),
+                'peer_certificate_chain': ssl_socket.getpeercert_chain(),
+                'ssl_version': ssl_socket.version(),
+                'server_side': ssl_socket.server_side,
+                'do_handshake_on_connect': ssl_socket.do_handshake_on_connect
+            }
+            
+        except Exception as e:
+            logger.error(f"Erreur récupération info connexion: {e}")
+            return {'error': str(e)}
+    
+    def cleanup(self):
+        """Nettoyage des ressources SSL"""
+        try:
+            if self.ssl_context:
+                self.ssl_context = None
+            
+            self.certificates_info.clear()
+            
+            logger.debug("Nettoyage SSL effectué")
+            
+        except Exception as e:
+            logger.error(f"Erreur nettoyage SSL: {e}")
+    
+    def __del__(self):
+        """Destructeur - nettoyage automatique"""
+        try:
+            self.cleanup()
+        except:
+            pass

