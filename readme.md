@@ -1,10 +1,3 @@
-# 🎓 RAT Project - Remote Administration Tool
-
-[![Python Version](https://img.shields.io/badge/python-3.8%2B-blue.svg)](https://www.python.org/downloads/)
-[![License](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
-[![Code Style](https://img.shields.io/badge/code%20style-black-000000.svg)](https://github.com/psf/black)
-[![Security](https://img.shields.io/badge/security-educational-orange.svg)](#security-notice)
-
 > ⚠️ **AVERTISSEMENT IMPORTANT** ⚠️  
 > Ce projet est développé **exclusivement à des fins éducatives** dans le cadre d'un cours de cybersécurité. Il ne doit être utilisé que sur des machines personnelles avec consentement explicite.
 
@@ -311,5 +304,6 @@ Les développeurs de ce projet :
 
 *Développé avec ❤️ pour l'apprentissage de la cybersécurité*
 
-</div>#   R A T  
+</div>#   R A T 
+ 
  
